@@ -8,6 +8,7 @@ import json
 import time
 import hmac
 import hashlib
+import secrets
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone
 from pydantic import BaseModel, Field
@@ -24,7 +25,7 @@ PHI_PATTERNS = [
 
 
 class SecurityException(Exception):
-    """Raised when outbound data violates HIPAA Safe Harbor or contains raw PHI."""
+    """Raised when a recognized sensitive-identifier pattern is detected."""
     pass
 
 
@@ -61,17 +62,20 @@ class AuditTrail:
         if not resolved_key:
             import warnings
             warnings.warn(
-                "AUDIT_SECRET_KEY not set. Using development-only fallback. "
-                "Set AUDIT_SECRET_KEY env var in production.",
+                "AUDIT_SECRET_KEY not set. Using a random in-memory development key; "
+                "set AUDIT_SECRET_KEY for stable verification across restarts.",
                 RuntimeWarning,
                 stacklevel=2,
             )
-            resolved_key = "DEV-ONLY-CHANGE-ME-IN-PRODUCTION"
-        self.secret_key = resolved_key.encode("utf-8")
+            self.secret_key = secrets.token_bytes(32)
+        else:
+            self.secret_key = resolved_key.encode("utf-8")
         self.logs: List[Dict[str, Any]] = []
 
     def log(self, actor: str, actor_tier: str, event_type: str, details: Dict[str, Any]) -> Dict[str, Any]:
-        payload_str = json.dumps(details, sort_keys=True)
+        for field in (actor, actor_tier, event_type):
+            assert_no_phi(field)
+        payload_str = json.dumps(details, sort_keys=True, allow_nan=False)
         assert_no_phi(payload_str)
         payload_hash = hashlib.sha256(payload_str.encode("utf-8")).hexdigest()
         audit_id = f"AUDIT-{int(time.time()*1000)}-{len(self.logs)+1}"
@@ -93,14 +97,24 @@ class AuditTrail:
         return entry
 
     def verify_integrity(self) -> bool:
-        for i, entry in enumerate(self.logs):
-            prev = self.logs[i-1]["current_hash"] if i > 0 else "GENESIS_BLOCK_0000000000000000"
-            if entry["prev_hash"] != prev:
+        previous = "GENESIS_BLOCK_0000000000000000"
+        for entry in self.logs:
+            if entry["prev_hash"] != previous:
                 return False
+            sign_string = "|".join(str(entry[key]) for key in (
+                "audit_id", "timestamp", "actor", "actor_tier",
+                "event_type", "payload_hash", "prev_hash"
+            ))
+            signature = hmac.new(
+                self.secret_key, sign_string.encode("utf-8"), hashlib.sha256
+            ).hexdigest()
+            if not hmac.compare_digest(signature, entry["current_hash"]):
+                return False
+            previous = signature
         return True
 
     def get_trail(self) -> List[Dict[str, Any]]:
-        return self.logs
+        return [entry.copy() for entry in self.logs]
 
 
 GLOBAL_AUDIT = AuditTrail()
