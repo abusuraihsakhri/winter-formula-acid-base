@@ -12,73 +12,41 @@ from agents.base import AuditTrail, PHIGuard, SecurityException, assert_no_phi
 
 
 class TestCalculateMetricsEdgeCases:
-    """Test edge cases in the core algorithm."""
+    def test_required_hco3(self):
+        with pytest.raises(ValueError, match="hco3 is required"):
+            calculate_metrics()
 
-    def test_empty_kwargs(self):
-        """calculate_metrics with no args should return default score."""
-        res = calculate_metrics()
-        assert res["score"] == 1.0
-        assert res["classification"] == "Low / Standard"
+    def test_non_numeric_rejected(self):
+        with pytest.raises(ValueError, match="hco3 must be a number"):
+            calculate_metrics(hco3="not a number")
 
-    def test_single_value(self):
-        res = calculate_metrics(v1=15.0)
-        assert res["score"] == 15.0
-        assert res["classification"] == "Moderate / Intermediate"
-
-    def test_multiple_values(self):
-        res = calculate_metrics(v1=10.0, v2=4.0, v3=2.0)
-        # score = 10.0 + 4.0/2 + 2.0/3 = 10 + 2 + 0.67 = 12.67
-        assert res["score"] == pytest.approx(12.67, abs=0.01)
-
-    def test_string_values_ignored(self):
-        """Non-numeric strings should not affect score."""
-        res = calculate_metrics(v1=10.0, name="test")
-        assert res["score"] == 10.0
-
-    def test_none_values_ignored(self):
-        res = calculate_metrics(v1=10.0, v2=None)
-        assert res["score"] == 10.0
-
-    def test_high_score_classification(self):
-        res = calculate_metrics(v1=30.0)
-        assert res["classification"] == "High / Severe"
-        assert "urgent" in res["clinical_recommendation"].lower()
-
-    def test_inputs_evaluated_count(self):
-        res = calculate_metrics(v1=5.0, v2=3.0)
-        assert res["inputs_evaluated"] == 2
+    def test_expected_range(self):
+        assert calculate_metrics(hco3=10)["expected_pco2"] == 23.0
 
 
 class TestProcessBatchValidation:
-    """Test input validation in process_batch."""
-
-    def test_missing_file_raises_error(self, tmp_path):
+    def test_missing_file(self, tmp_path):
         with pytest.raises(FileNotFoundError):
-            process_batch(str(tmp_path / "nonexistent.csv"), str(tmp_path / "out.csv"))
+            process_batch(str(tmp_path / "missing.csv"), str(tmp_path / "out.csv"))
 
-    def test_empty_csv_raises_error(self, tmp_path):
-        empty = tmp_path / "empty.csv"
-        empty.write_text("", encoding="utf-8")
+    def test_empty_csv(self, tmp_path):
+        source = tmp_path / "empty.csv"
+        source.write_text("")
         with pytest.raises(ValueError, match="empty or has no headers"):
-            process_batch(str(empty), str(tmp_path / "out.csv"))
+            process_batch(str(source), str(tmp_path / "out.csv"))
 
-    def test_csv_with_only_headers(self, tmp_path):
-        csv_in = tmp_path / "headers_only.csv"
-        csv_out = tmp_path / "out.csv"
-        csv_in.write_text("Patient_ID,v1,v2\n", encoding="utf-8")
-        process_batch(str(csv_in), str(csv_out))
-        content = csv_out.read_text(encoding="utf-8")
-        assert "Patient_ID" in content
+    def test_header_only_batch(self, tmp_path):
+        source = tmp_path / "input.csv"
+        source.write_text("Case_ID,hco3,pco2\\n".replace("\\n", "\n"))
+        target = tmp_path / "output.csv"
+        process_batch(str(source), str(target))
+        assert "expected_pco2" in target.read_text()
 
-    def test_batch_output_fields(self, tmp_path):
-        csv_in = tmp_path / "in.csv"
-        csv_out = tmp_path / "out.csv"
-        csv_in.write_text("ID,v1,v2\nA,1.0,2.0\n", encoding="utf-8")
-        process_batch(str(csv_in), str(csv_out))
-        content = csv_out.read_text(encoding="utf-8")
-        assert "score" in content
-        assert "classification" in content
-        assert "clinical_recommendation" in content
+    def test_missing_required_column(self, tmp_path):
+        source = tmp_path / "input.csv"
+        source.write_text("Case_ID,pco2\\nA,28\\n".replace("\\n", "\n"))
+        with pytest.raises(ValueError, match="must include hco3"):
+            process_batch(str(source), str(tmp_path / "output.csv"))
 
 
 class TestPHIGuard:
