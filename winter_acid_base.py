@@ -1,123 +1,169 @@
 #!/usr/bin/env python3
-"""
-Winter's Formula & Metabolic Acid-Base Compensation
-Evaluates expected pCO2 in metabolic acidosis, delta ratio (Delta AG / Delta HCO3), and mixed acid-base disorders.
+"""Winter's formula and optional anion-gap calculations.
 
-Zero-dependency Python implementation with single and batch evaluation.
-Author: Dr. Abu Suraih Sakhri
-License: MIT
+Clinical interpretation aid, not a diagnosis or treatment recommendation.
+All partial pressures are in mmHg, electrolytes in mmol/L (mEq/L for these
+monovalent electrolytes), and albumin in g/dL.
 """
-
 import argparse
 import csv
 import json
-import sys
-from typing import Dict, Any
+import math
+from pathlib import Path
 
 
-def calculate_metrics(**kwargs) -> Dict[str, Any]:
+OUTPUT_FIELDS = (
+    "expected_pco2", "expected_pco2_low", "expected_pco2_high",
+    "respiratory_interpretation", "anion_gap", "corrected_anion_gap",
+    "delta_ratio",
+)
+
+
+def _number(name, value, minimum, maximum):
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a number") from exc
+    if not math.isfinite(result) or not minimum < result <= maximum:
+        raise ValueError(f"{name} must be finite and > {minimum} and <= {maximum}")
+    return result
+
+
+def calculate_metrics(*, hco3=None, pco2=None, sodium=None, chloride=None,
+                      albumin=None, **extra):
+    """Calculate expected PaCO2 = 1.5 * HCO3 + 8 (+/- 2).
+
+    This compensation estimate applies to metabolic acidosis; bicarbonate
+    alone does not establish the primary acid-base disorder. Optional anion
+    gap uses Na - (Cl + HCO3) without potassium, corrected to albumin 4 g/dL.
+    Delta ratio uses a reference AG of 12 and reference HCO3 of 24.
     """
-    Core domain algorithm for winter-formula-acid-base.
-    """
-    params = {}
-    for k, v in kwargs.items():
-        if v is not None:
-            try:
-                params[k] = float(v)
-            except (ValueError, TypeError):
-                params[k] = str(v)
+    if extra:
+        raise ValueError("Unknown parameters: " + ", ".join(sorted(extra)))
+    if hco3 is None or hco3 == "":
+        raise ValueError("hco3 is required")
+    bicarb = _number("hco3", hco3, 0, 60)
+    observed = None if pco2 is None or pco2 == "" else _number("pco2", pco2, 0, 150)
 
-    # Deterministic domain logic
-    numeric_vals = [val for val in params.values() if isinstance(val, (int, float))]
-    primary_val = numeric_vals[0] if numeric_vals else 1.0
+    if (sodium is None or sodium == "") != (chloride is None or chloride == ""):
+        raise ValueError("sodium and chloride must be provided together")
+    if albumin is not None and albumin != "" and (sodium is None or sodium == ""):
+        raise ValueError("albumin requires sodium and chloride")
 
-    score = primary_val
-    for idx, nv in enumerate(numeric_vals[1:], start=2):
-        score += nv * (1.0 / idx)
-
-    rounded_score = round(score, 2)
-    
-    # Classification / tiering
-    if rounded_score < 10.0:
-        tier = "Low / Standard"
-        action = "Standard monitoring or negative cutoff"
-    elif rounded_score < 25.0:
-        tier = "Moderate / Intermediate"
-        action = "Close observation or secondary evaluation"
+    expected = 1.5 * bicarb + 8
+    low, high = expected - 2, expected + 2
+    if bicarb >= 24:
+        interpretation = "Not applicable: metabolic acidosis not established"
+    elif observed is None:
+        interpretation = "Observed PaCO2 not provided"
+    elif observed < low:
+        interpretation = "Lower than expected: additional respiratory alkalosis possible"
+    elif observed > high:
+        interpretation = "Higher than expected: additional respiratory acidosis possible"
     else:
-        tier = "High / Severe"
-        action = "Urgent clinical intervention or primary positive finding"
+        interpretation = "Within expected compensatory range"
+
+    ag = corrected_ag = delta_ratio = None
+    if sodium is not None and sodium != "":
+        na = _number("sodium", sodium, 0, 250)
+        cl = _number("chloride", chloride, 0, 220)
+        ag = na - cl - bicarb
+        alb = 4.0 if albumin is None or albumin == "" else _number("albumin", albumin, 0, 8)
+        corrected_ag = ag + 2.5 * (4.0 - alb)
+        if bicarb < 24 and corrected_ag > 12:
+            delta_ratio = (corrected_ag - 12) / (24 - bicarb)
+
+    def rounded(value):
+        return None if value is None else round(value, 2)
 
     return {
-        "tool": "winter-formula-acid-base",
-        "score": rounded_score,
-        "classification": tier,
-        "clinical_recommendation": action,
-        "inputs_evaluated": len(params),
+        "expected_pco2": rounded(expected),
+        "expected_pco2_low": rounded(low),
+        "expected_pco2_high": rounded(high),
+        "respiratory_interpretation": interpretation,
+        "anion_gap": rounded(ag),
+        "corrected_anion_gap": rounded(corrected_ag),
+        "delta_ratio": rounded(delta_ratio),
     }
 
 
-def process_single(args) -> None:
-    kwargs = vars(args)
-    kwargs.pop("func", None)
-    res = calculate_metrics(**kwargs)
-    print(json.dumps(res, indent=2))
+def process_single(args):
+    result = calculate_metrics(
+        hco3=args.hco3, pco2=args.pco2, sodium=args.sodium,
+        chloride=args.chloride, albumin=args.albumin,
+    )
+    print(json.dumps(result, indent=2))
 
 
-def process_batch(input_csv: str, output_csv: str) -> None:
-    import os
-    if not os.path.isfile(input_csv):
+def _csv_safe(value):
+    """Prevent formula execution when CSV is opened in spreadsheet software."""
+    s = str(value)
+    if s.lstrip().startswith(("=", "+", "-", "@")) and not _is_plain_number(s):
+        return "'" + s
+    return s
+
+
+def _is_plain_number(value):
+    try:
+        return math.isfinite(float(value))
+    except (ValueError, TypeError):
+        return False
+
+
+def process_batch(input_csv, output_csv):
+    source = Path(input_csv)
+    if not source.is_file():
         raise FileNotFoundError(f"Input CSV not found: {input_csv}")
-
-    with open(input_csv, mode="r", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        fieldnames = list(reader.fieldnames or [])
+    with source.open(encoding="utf-8-sig", newline="") as stream:
+        reader = csv.DictReader(stream)
+        headers = list(reader.fieldnames or [])
+        if not headers:
+            raise ValueError("Input CSV is empty or has no headers")
+        if "hco3" not in headers:
+            raise ValueError("Input CSV must include hco3")
+        if any(key in OUTPUT_FIELDS for key in headers):
+            raise ValueError("Input CSV contains reserved output column names")
         rows = list(reader)
 
-    if not fieldnames:
-        raise ValueError(f"Input CSV is empty or has no headers: {input_csv}")
+    output_rows = []
+    for idx, row in enumerate(rows, start=2):
+        if None in row:
+            raise ValueError(f"Row {idx}: more values than header columns")
+        try:
+            result = calculate_metrics(**{
+                key: row.get(key) for key in ("hco3", "pco2", "sodium", "chloride", "albumin")
+            })
+        except ValueError as exc:
+            raise ValueError(f"Row {idx}: {exc}") from exc
+        output_rows.append({**{key: _csv_safe(value or "") for key, value in row.items()}, **result})
 
-    out_fields = fieldnames + ["score", "classification", "clinical_recommendation"]
-    out_rows = []
-
-    for r in rows:
-        calc_res = calculate_metrics(**r)
-        row_dict = dict(r)
-        row_dict["score"] = calc_res["score"]
-        row_dict["classification"] = calc_res["classification"]
-        row_dict["clinical_recommendation"] = calc_res["clinical_recommendation"]
-        out_rows.append(row_dict)
-
-    with open(output_csv, mode="w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=out_fields)
+    with open(output_csv, "w", encoding="utf-8", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=headers + list(OUTPUT_FIELDS))
         writer.writeheader()
-        writer.writerows(out_rows)
-
-    print(f"Processed {len(out_rows)} records -> {output_csv}")
+        writer.writerows(output_rows)
+    print(f"Processed {len(output_rows)} records -> {output_csv}")
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Winter's Formula & Metabolic Acid-Base Compensation")
-    subparsers = parser.add_subparsers(dest="command", required=True)
-
-    # Single parser
-    single_parser = subparsers.add_parser("single", help="Evaluate single case")
-    single_parser.add_argument("--v1", type=float, default=10.0, help="Primary parameter")
-    single_parser.add_argument("--v2", type=float, default=5.0, help="Secondary parameter")
-    single_parser.add_argument("--v3", type=float, default=2.0, help="Tertiary parameter")
-    single_parser.set_defaults(func=process_single)
-
-    # Batch parser
-    batch_parser = subparsers.add_parser("batch", help="Process batch CSV")
-    batch_parser.add_argument("-i", "--input", required=True, help="Input CSV")
-    batch_parser.add_argument("-o", "--output", default="results.csv", help="Output CSV")
-
+    parser = argparse.ArgumentParser(description="Winter's formula: metabolic acidosis compensation")
+    commands = parser.add_subparsers(dest="command", required=True)
+    single = commands.add_parser("single", help="Calculate one case")
+    single.add_argument("--hco3", "--v1", type=float, required=True, help="Bicarbonate, mmol/L")
+    single.add_argument("--pco2", "--v2", type=float, help="Observed arterial PaCO2, mmHg")
+    single.add_argument("--sodium", type=float, help="Serum sodium, mmol/L")
+    single.add_argument("--chloride", type=float, help="Serum chloride, mmol/L")
+    single.add_argument("--albumin", type=float, help="Albumin, g/dL")
+    batch = commands.add_parser("batch", help="Calculate cases from CSV")
+    batch.add_argument("-i", "--input", required=True)
+    batch.add_argument("-o", "--output", default="results.csv")
     args = parser.parse_args(argv)
-
-    if args.command == "single":
-        args.func(args)
-    elif args.command == "batch":
-        process_batch(args.input, args.output)
+    try:
+        if args.command == "single":
+            process_single(args)
+        else:
+            process_batch(args.input, args.output)
+    except (ValueError, OSError) as exc:
+        parser.error(str(exc))
 
 
 if __name__ == "__main__":
